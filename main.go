@@ -1,16 +1,25 @@
 package main
 
-// #cgo pkg-config: gtk+-3.0
+// // #cgo pkg-config: gtk+-3.0
+// // #include <gtk/gtk.h>
+// import "C"
+
+// // #include "gtk.go.h"
 // #include <gtk/gtk.h>
+// #cgo pkg-config: gtk+-2.0
 import "C"
 
 import (
-    "unsafe"
+    // "unsafe"
+    // "time"
     "fmt"
     "bufio"
     "os"
     "log"
-    "github.com/gotk3/gotk3/gtk"
+    // "math"
+    "github.com/xthexder/go-jack"
+    "github.com/mattn/go-gtk/gdk"
+    "github.com/mattn/go-gtk/gtk"
     "github.com/javyre/jamyxgo"
 )
 
@@ -24,89 +33,173 @@ func interactiveLoop(session *jamyxgo.Session) {
     }
 }
 
-func inputBoxWidget(input string, session *jamyxgo.Session) *gtk.Widget {
-    grid, err := gtk.GridNew()
-	if err != nil {
-		log.Fatal("Unable to create grid:", err)
-	}
+func channelWidget(isinput bool, chan_name string, session *jamyxgo.Session) (channel gtk.IWidget, meter *gtk.ProgressBar) {
+    name_label := gtk.NewLabel(chan_name)
+    name_label.SetSizeRequest(0, -1)
 
-    name_label, err := gtk.LabelNew(input)
-    if err != nil {
-        log.Fatal("Unable to create label:", err)
-    }
-    vol_slider, err := gtk.ScaleNewWithRange(gtk.ORIENTATION_VERTICAL, 0, 100, 1)
-    if err != nil {
-        log.Fatal("Unable to create scale:", err)
-    }
+    initial_vol:= session.VolumeGet(isinput, chan_name)
+    var precision int
+    if precision=2; initial_vol == 100 { precision = 1 }
+    vol_label_text := fmt.Sprintf("%5.[2]*[1]f", initial_vol, precision)
 
-    vol_slider.Widget.SetVExpand(true)
-    vol_slider.SetValue(session.VolumeInputGet(input))
-    C.gtk_range_set_inverted((*C.struct__GtkRange)(unsafe.Pointer(vol_slider.Range.GObject)), C.gboolean(1))
+    vol_label  := gtk.NewLabel(vol_label_text)
+    vol_slider := gtk.NewVScaleWithRange(0, 100, 1)
+    vol_monitor:= gtk.NewProgressBar()
+    vol_frame  := gtk.NewFrame("")
+    vol_vbox   := gtk.NewVBox(false, 0)
+    vol_hbox   := gtk.NewHBox(true, 0)
+
+    is_local_change := false
+
+    vol_label.SetPadding(3, 3)
+    vol_slider.SetDrawValue(false)
+    vol_slider.SetValue(initial_vol)
+    vol_slider.SetInverted(true)
     vol_slider.Connect("value_changed", func(){
-        session.VolumeInputSet(input, vol_slider.GetValue())
+        is_local_change = true
+        vol := vol_slider.GetValue()
+        session.VolumeSet(isinput, chan_name, vol)
+        var precision int
+        if precision=2; vol == 100 { precision = 1 }
+        vol_label.SetText(fmt.Sprintf("%5.[2]*[1]f", vol, precision))
     })
+    vol_monitor.SetOrientation(gtk.PROGRESS_BOTTOM_TO_TOP)
 
-    grid.Widget.SetVExpand(true)
-    grid.Attach(name_label, 0, 0, 1, 1)
-    grid.Attach(vol_slider, 0, 1, 1, 1)
+    vol_hbox.PackStart(vol_slider , true, true, 0)
+    vol_hbox.PackStart(vol_monitor, false, false, 0)
+    vol_vbox.PackStart(vol_label, false, false, 0)
+    vol_vbox.PackStart(vol_hbox , true , true , 0)
+    vol_frame.Add(vol_vbox)
+
+    vbox := gtk.NewVBox(false, 0)
+    vbox.PackStart(name_label, false, false, 0)
+    vbox.PackStart(vol_frame,  true,  true,  0)
 
     go func() {
         local_session := jamyxgo.Session{}
         local_session.Connect("127.0.0.1", 2909)
         for {
             // This is a blocking call waiting for a change in volume and returning it
-            vol_slider.SetValue(local_session.VolumeInputListen(input))
+            vol := local_session.VolumeListen(isinput, chan_name)
+            if is_local_change {
+                is_local_change = false
+                continue
+            }
+            vol_slider.SetValue(vol)
+            var precision int
+            if precision=2; vol == 100 { precision = 1 }
+            vol_label.SetText(fmt.Sprintf("%5.[2]*[1]f", vol, precision))
         }
     }()
 
-    return &grid.Widget
+    return vbox, vol_monitor
 }
 
-func windowWidget(session *jamyxgo.Session) *gtk.Widget {
-    grid, err := gtk.GridNew()
-	if err != nil {
-		log.Fatal("Unable to create grid:", err)
-	}
-    grid.Widget.SetVExpand(true)
-    grid.Widget.SetHExpand(true)
-    // grid.SetOrientation(gtk.ORIENTATION_VERTICAL)
+type Meter struct {
+    PortName string
+    Port *jack.Port
+    MeterGtk *gtk.ProgressBar
+    MeterValue float32
+}
 
-    inputs := session.GetInputs()
+var g_meters [](*Meter)
+
+func jackProcess(nframes uint32) int {
+    for _, meter := range g_meters {
+        frames := meter.Port.GetBuffer(nframes)
+
+        // find peak
+        var peak float32 = 0
+        for _, frame := range frames {
+            if float32(frame) > peak { peak = float32(frame) }
+        }
+        // meter.MeterValue = peak
+        // fmt.Println(meter.MeterValue)
+
+        gdk.ThreadsEnter()
+        meter.MeterGtk.SetFraction(float64(peak))
+        // fmt.Println((*C.GtkProgressBar)(unsafe.Pointer(gtk.PROGRESS_BAR(meter.MeterGtk))))
+        gdk.ThreadsLeave()
+    }
+    return 0
+}
+
+func windowWidget(session *jamyxgo.Session, jclient *jack.Client) gtk.IWidget {
+    hbox := gtk.NewHBox(false, 0)
+
+    inputs  := session.GetInputs()
+    outputs := session.GetOutputs()
+
+    var meters []*Meter
+
     log.Println("Inputs:", inputs)
+    for _, in := range inputs {
+        chan_w, vol_meter := channelWidget(true, in, session)
+        hbox.PackStart(chan_w, false, true, 0)
 
-    var inputBoxes []*gtk.Widget
-    for i, in := range inputs {
-        inputBoxes = append(inputBoxes, inputBoxWidget(in, session))
-        grid.Attach(inputBoxes[i], i, 0, 1, 1)
-        // time.Sleep(150 * time.Millisecond)
+        pn := fmt.Sprintf("jamyxer:%s Out L", in)
+        meters = append(meters, &Meter{
+            PortName: pn,
+            Port: jclient.GetPortByName(pn),
+            MeterGtk: vol_meter,
+            MeterValue: 0,
+        })
     }
-    for i, inb := range inputBoxes {
-        log.Println(i, inb)
+
+    log.Println("Outputs:", outputs)
+    for _, out := range outputs {
+        chan_w, vol_meter := channelWidget(false, out, session)
+        hbox.PackEnd(chan_w, false, true, 0)
+
+        pn := fmt.Sprintf("jamyxer:%s L", out)
+        meters = append(meters, &Meter{
+            PortName: pn,
+            Port: jclient.GetPortByName(pn),
+            MeterGtk: vol_meter,
+            MeterValue: 0,
+        })
     }
-    // l, err := gtk.LabelNew("Hello, world!")
-    // if err != nil {
-    //     log.Fatal("Unable to create label:", err)
-    // }
-    // grid.Attach(l, 0, 0, 2, 1)
-    return &grid.Container.Widget
+    g_meters = meters
+
+
+    return hbox
 }
 
-func setupWindow(session *jamyxgo.Session) {
+func setupWindow(session *jamyxgo.Session, jclient *jack.Client) {
+    gdk.ThreadsInit()
     gtk.Init(nil)
-    win, err := gtk.WindowNew(gtk.WINDOW_TOPLEVEL)
-    if err != nil {
-        log.Fatal("Unable to create window:", err)
-    }
-    win.SetTitle("Simple Example")
-    win.Connect("destroy", func() {
-        gtk.MainQuit()
-    })
+    window := gtk.NewWindow(gtk.WINDOW_TOPLEVEL)
+	window.SetPosition(gtk.WIN_POS_CENTER)
+	window.SetTitle("Jamyxui")
+    window.Connect("destroy", gtk.MainQuit)
 
-    win.Add(windowWidget(session))
+    window.Add(windowWidget(session, jclient))
 
-    win.SetDefaultSize(500, 300)
+    window.SetSizeRequest(-1, 300)
+    window.ShowAll()
+}
 
-    win.ShowAll()
+func setupJack(session *jamyxgo.Session) *jack.Client {
+    client, _ := jack.ClientOpen("Jamyxui channels monitor", jack.NoStartServer)
+    if client == nil { log.Fatal("Could not connect to jack server!") }
+
+    client.SetProcessCallback(jackProcess)
+
+    if code := client.Activate(); code != 0 { log.Fatal("Failed to activate client!") }
+
+    // go func() {
+    //     for {
+    //         gdk.ThreadsEnter()
+    //         for _, meter := range g_meters {
+    //             meter.MeterGtk.SetFraction(float64(meter.MeterValue))
+    //             // fmt.Println(float64(meter.MeterValue))
+    //         }
+    //         gdk.ThreadsLeave()
+    //         time.Sleep(8 * time.Millisecond)
+    //     }
+    // }()
+
+    return client
 }
 
 func main() {
@@ -115,7 +208,12 @@ func main() {
 
     go interactiveLoop(&session)
 
-    setupWindow(&session)
+    jclient := setupJack(&session)
+    defer jclient.Close()
+
+    fmt.Println(jclient.GetPorts("jamyxer:.*", ".*", 0))
+
+    setupWindow(&session, jclient)
 
     gtk.Main()
 }
