@@ -10,7 +10,7 @@ import "C"
 
 import (
     "unsafe"
-    // "time"
+    "time"
     "fmt"
     "bufio"
     "os"
@@ -167,7 +167,7 @@ func monitorButtonCB(mon_butt *monitorButton, session *jamyxgo.Session) {
 func channelWidget(isinput bool,
                    chan_name string,
                    session *jamyxgo.Session,
-                   jclient *jack.Client,
+                   jclient **jack.Client,
                ) (widget *gtk.VBox, meter *Meter) {
 
     // Macro
@@ -261,8 +261,8 @@ func channelWidget(isinput bool,
 
     meter             = new(Meter)
     meter.PortName    = fmt.Sprintf("jamyxer:%s %s", chan_name, suffix)
-    meter.PortL       = jclient.GetPortByName(meter.PortName+"L")
-    meter.PortR       = jclient.GetPortByName(meter.PortName+"R")
+    meter.PortL       = (*jclient).GetPortByName(meter.PortName+"L")
+    meter.PortR       = (*jclient).GetPortByName(meter.PortName+"R")
     meter.MeterGtk    = vol_monitor
     meter.MeterValueL = &meterValL
     meter.MeterValueR = &meterValR
@@ -295,7 +295,7 @@ func jackProcess(nframes uint32) int {
     return 0
 }
 
-func windowWidget(session *jamyxgo.Session, jclient *jack.Client) gtk.IWidget {
+func windowWidget(session *jamyxgo.Session, jclient **jack.Client) gtk.IWidget {
     hbox := gtk.NewHBox(false, 0)
 
     inputs  := session.GetInputs()
@@ -336,7 +336,7 @@ func windowWidget(session *jamyxgo.Session, jclient *jack.Client) gtk.IWidget {
     return hbox
 }
 
-func setupWindow(session *jamyxgo.Session, jclient *jack.Client) {
+func setupWindow(session *jamyxgo.Session, jclient **jack.Client) {
     gdk.ThreadsInit()
     gtk.Init(nil)
     window := gtk.NewWindow(gtk.WINDOW_TOPLEVEL)
@@ -386,14 +386,38 @@ func setupWindow(session *jamyxgo.Session, jclient *jack.Client) {
     window.ShowAll()
 }
 
-func setupJack(session *jamyxgo.Session) *jack.Client {
-    client, _ := jack.ClientOpen("Jamyxui channels monitor", jack.NoStartServer)
-    if client == nil { log.Fatal("Could not connect to jack server!") }
+func setupJack(session *jamyxgo.Session) **jack.Client {
+    var jclient **jack.Client = new(*jack.Client)
+    isAlive := false
 
-    client.SetProcessCallback(jackProcess)
+    setup := func () {
+        client, _ := jack.ClientOpen("Jamyxui channels monitor", jack.NoStartServer)
+        if client == nil {
+            log.Println("Could not (re)connect to jack server!")
+            isAlive = false
+            return
+        } else { isAlive = true }
 
-    if code := client.Activate(); code != 0 { log.Fatal("Failed to activate client!") }
+        client.SetProcessCallback(jackProcess)
+        client.OnShutdown(func() { isAlive = false })
 
+        if code := client.Activate(); code != 0 { log.Fatal("Failed to activate client!") }
+
+        *jclient = client
+    }
+
+    // Reconnection loop
+    go func() { for {
+        if !isAlive {
+            fmt.Println("Attempting reconnection to jack server...")
+            setup()
+        }
+        time.Sleep(2*time.Second)
+    } } ()
+
+    for !isAlive {
+        time.Sleep(500*time.Millisecond)
+    }
     // go func() {
     //     for {
     //         gdk.ThreadsEnter()
@@ -406,7 +430,7 @@ func setupJack(session *jamyxgo.Session) *jack.Client {
     //     }
     // }()
 
-    return client
+    return jclient
 }
 
 func main() {
@@ -416,9 +440,9 @@ func main() {
     go interactiveLoop(&session)
 
     jclient := setupJack(&session)
-    defer jclient.Close()
+    defer (*jclient).Close()
 
-    fmt.Println(jclient.GetPorts("jamyxer:.*", ".*", 0))
+    fmt.Println((*jclient).GetPorts("jamyxer:.*", ".*", 0))
 
     setupWindow(&session, jclient)
 
