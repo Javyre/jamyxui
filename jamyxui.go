@@ -386,20 +386,21 @@ func setupWindow(session *jamyxgo.Session, jclient **jack.Client) {
     window.ShowAll()
 }
 
+var isClientAlive bool = false
 func setupJack(session *jamyxgo.Session) **jack.Client {
     var jclient **jack.Client = new(*jack.Client)
-    isAlive := false
+    // isClientAlive := false
 
     setup := func () {
         client, _ := jack.ClientOpen("Jamyxui channels monitor", jack.NoStartServer)
         if client == nil {
             log.Println("Could not (re)connect to jack server!")
-            isAlive = false
+            isClientAlive = false
             return
-        } else { isAlive = true }
+        } else { isClientAlive = true }
 
         client.SetProcessCallback(jackProcess)
-        client.OnShutdown(func() { isAlive = false })
+        client.OnShutdown(func() { isClientAlive = false })
 
         if code := client.Activate(); code != 0 { log.Fatal("Failed to activate client!") }
 
@@ -408,14 +409,14 @@ func setupJack(session *jamyxgo.Session) **jack.Client {
 
     // Reconnection loop
     go func() { for {
-        if !isAlive {
+        if !isClientAlive {
             fmt.Println("Attempting reconnection to jack server...")
             setup()
         }
         time.Sleep(2*time.Second)
     } } ()
 
-    for !isAlive {
+    for !isClientAlive {
         time.Sleep(500*time.Millisecond)
     }
     // go func() {
